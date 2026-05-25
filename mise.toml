@@ -1,0 +1,5 @@
+[tools]
+"cargo:esp-generate" = "latest"
+"cargo:probe-rs-tools" = "latest"
+"cargo:esp-config" = { version = "latest", features = "tui" }
+python = "3.14"
