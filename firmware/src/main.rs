@@ -9,21 +9,23 @@
 
 use defmt::{debug, error, info};
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
-use embassy_time::{Duration, Timer, with_timeout};
-use embedded_can::Frame as _;
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_sync::{
+    blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
+    mutex::Mutex,
+};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{
-    Async,
-    clock::CpuClock,
-    gpio::{Input, Level, Output, OutputConfig},
-    i2c::master::I2c,
-    timer::timg::TimerGroup,
-    twai,
+    Async, clock::CpuClock, gpio::Input, i2c::master::I2c, timer::timg::TimerGroup, twai,
 };
 use panic_rtt_target as _;
 use static_cell::StaticCell;
 
-use crate::iox::SwitchState;
+use crate::{
+    cook::{Burner, Pan, PanState, Power},
+    iox::SwitchState,
+    leds::{LedState, Pattern, Status},
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -32,7 +34,146 @@ type I2cBus = Mutex<NoopRawMutex, I2c<'static, Async>>;
 static I2C_BUS: static_cell::StaticCell<I2cBus> = StaticCell::new();
 
 mod cook;
+mod heartbeat;
 mod iox;
+mod leds;
+
+enum State {
+    Fault { since: Instant },
+    Off { last_input: SwitchState },
+    On,
+}
+
+struct Controller<'a> {
+    stove: cook::Stove<'a>,
+    state: State,
+    link_mode: bool,
+    last_toggle: Instant,
+    last_activity: Instant,
+}
+
+impl<'a> Controller<'a> {
+    fn new(stove: cook::Stove<'a>, initial_switch_pos: SwitchState) -> Self {
+        Self {
+            stove,
+            state: State::Off {
+                last_input: initial_switch_pos,
+            },
+            link_mode: false,
+            last_toggle: Instant::from_ticks(0),
+            last_activity: Instant::now(),
+        }
+    }
+
+    async fn startup(
+        &mut self,
+        switches: SwitchState,
+        pans_rx: &mut embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, PanState, 2>,
+    ) -> Result<(), cook::Error> {
+        Timer::at(self.last_toggle + Duration::from_secs(1)).await;
+        self.last_toggle = Instant::now();
+        self.last_activity = Instant::now();
+        self.stove.startup().await?;
+
+        // Wait briefly for pan detection.
+        let pans = match select(
+            Timer::after_secs(1),
+            pans_rx.changed_and(|&v| v != PanState::ABSENT),
+        )
+        .await
+        {
+            Either::First(_) => pans_rx.get().await,
+            Either::Second(pans) => pans,
+        };
+
+        self.update_link_mode(pans);
+        self.set_power(switches).await?;
+
+        leds::LED_STATE
+            .sender()
+            .send(led_state(switches, pans, self.link_mode));
+
+        self.state = State::On;
+        Ok(())
+    }
+
+    async fn shutdown(&mut self, switches: SwitchState) {
+        Timer::at(self.last_toggle + Duration::from_secs(1)).await;
+        self.last_toggle = Instant::now();
+        self.link_mode = false;
+
+        if let Err(e) = self.stove.shutdown().await {
+            error!("shutdown failed: {:?}", e);
+            self.fault();
+            return;
+        }
+
+        leds::LED_STATE
+            .sender()
+            .send(led_state(switches, PanState::ABSENT, false));
+        self.state = State::Off {
+            last_input: switches,
+        };
+    }
+
+    fn fault(&mut self) {
+        leds::LED_STATE.sender().send(LedState::fault());
+        self.link_mode = false;
+        self.state = State::Fault {
+            since: Instant::now(),
+        };
+
+        // This disables pan detection and power.
+        heartbeat::ENABLED.sender().send(false);
+    }
+
+    fn fault_reset(&mut self, switches: SwitchState) {
+        info!("fault reset");
+        leds::LED_STATE.sender().send(LedState::default());
+        self.state = State::Off {
+            last_input: switches,
+        };
+
+        heartbeat::ENABLED.sender().send(true);
+    }
+
+    /// Update link mode based on pan detection. Link mode activates
+    /// when both the middle and right pans are placed within one
+    /// second of each other.
+    fn update_link_mode(&mut self, pans: PanState) {
+        let (Pan::Present(middle), Pan::Present(right)) = (pans.middle, pans.right) else {
+            self.link_mode = false;
+            return;
+        };
+
+        let diff = if middle < right {
+            right - middle
+        } else {
+            middle - right
+        };
+
+        self.link_mode = diff < Duration::from_secs(1);
+    }
+
+    async fn set_power(&mut self, switches: SwitchState) -> Result<(), cook::Error> {
+        self.stove
+            .set_power(Burner::Left, Power::from_dial(switches.left))
+            .await?;
+        self.stove
+            .set_power(Burner::Right, Power::from_dial(switches.right))
+            .await?;
+
+        let middle_power = if self.link_mode {
+            Power::from_dial(switches.right)
+        } else {
+            Power::from_dial(switches.middle)
+        };
+
+        self.stove.set_power(Burner::Middle, middle_power).await?;
+
+        Ok(())
+    }
+}
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -41,7 +182,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // These GPIO pins are in use by the module and should not be used.
+    // These GPIO pins are in use by the module.
     let _ = peripherals.GPIO24;
     let _ = peripherals.GPIO25;
     let _ = peripherals.GPIO26;
@@ -55,33 +196,7 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    // Pin 5 (presence) is tied to 3.3V on the PCB.
-    // Pin 6 (pan detection heartbeat) on GPIO23: ~52 Hz, 25% duty.
-    let mut ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
-    ledc.set_global_slow_clock(esp_hal::ledc::LSGlobalClkSource::APBClk);
-
-    let mut hb_timer = ledc.timer::<esp_hal::ledc::LowSpeed>(esp_hal::ledc::timer::Number::Timer0);
-    esp_hal::ledc::timer::TimerIFace::configure(
-        &mut hb_timer,
-        esp_hal::ledc::timer::config::Config {
-            duty: esp_hal::ledc::timer::config::Duty::Duty14Bit,
-            clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
-            frequency: esp_hal::time::Rate::from_hz(26),
-        },
-    )
-    .unwrap();
-
-    let mut hb_channel = ledc.channel(esp_hal::ledc::channel::Number::Channel0, peripherals.GPIO23);
-    esp_hal::ledc::channel::ChannelIFace::configure(
-        &mut hb_channel,
-        esp_hal::ledc::channel::config::Config {
-            timer: &hb_timer,
-            duty_pct: 25,
-            drive_mode: esp_hal::gpio::DriveMode::PushPull,
-        },
-    )
-    .unwrap();
-
+    // i2c on pins (21, 7).
     let i2c = I2c::new(peripherals.I2C0, Default::default())
         .unwrap()
         .with_sda(peripherals.GPIO21)
@@ -91,7 +206,10 @@ async fn main(spawner: Spawner) -> ! {
 
     let inta = Input::new(peripherals.GPIO6, Default::default());
     spawner.spawn(iox::monitor_switches(i2c_bus, inta).unwrap());
+    spawner.spawn(leds::run(i2c_bus).unwrap());
+    spawner.spawn(heartbeat::run(peripherals.LEDC, peripherals.GPIO23.into()).unwrap());
 
+    // twai/CAN on pins (4, 5).
     let can_config = twai::TwaiConfiguration::new(
         peripherals.TWAI0,
         peripherals.GPIO5, // RXD
@@ -100,117 +218,148 @@ async fn main(spawner: Spawner) -> ! {
         twai::TwaiMode::Normal,
     );
 
-    let (can_rx, mut can_tx) = can_config.into_async().start().split();
+    let (can_rx, can_tx) = can_config.into_async().start().split();
     spawner.spawn(cook::can_dispatch(can_rx).unwrap());
-    let mut cook = cook::Cook::new(can_tx);
 
-    let mut sw = iox::SWITCH_STATE.receiver().unwrap();
-    let mut switch_state = SwitchState::default();
-    let mut power_level: u8 = 0;
-    let mut active = false;
-    let mut poll_ticker = embassy_time::Ticker::every(Duration::from_secs(1));
+    let stove = cook::Stove::new(can_tx);
+    let mut pans_rx = cook::PAN_STATE.receiver().unwrap();
+    let mut sw_rx = iox::SWITCH_STATE.receiver().unwrap();
+    let last_input = sw_rx.get().await;
+    let mut ctrl = Controller::new(stove, last_input);
+
+    info!("setup completed, querying cooktop");
+
+    if let Err(e) = ctrl.stove.read_serial(cook::Node::Psu).await {
+        error!("failed to query cooktop: {:?}", e);
+        ctrl.fault();
+    } else {
+        heartbeat::ENABLED.sender().send(true);
+    }
+
     loop {
-        use embassy_futures::select::{Either, select};
+        match ctrl.state {
+            State::Fault { since } => {
+                let st = match select(sw_rx.changed(), Timer::after_secs(1)).await {
+                    Either::First(st) => st,
+                    Either::Second(_) => sw_rx.get().await,
+                };
 
-        match select(sw.changed(), poll_ticker.next()).await {
-            Either::First(v) => {
-                debug!("switch state: {:?}", v);
-
-                let result = async {
-                    match v.sw1 {
-                        8 => {
-                            // Up button (GPB1).
-                            if !active {
-                                cook.startup().await?;
-                                active = true;
-                                power_level = 1;
-                            } else if power_level < 14 {
-                                power_level += 1;
-                            }
-                            info!("power level: {}", power_level);
-                            cook.set_power(
-                                cook::Device::LeftCoil,
-                                cook::Zone::Zone1,
-                                cook::Power::Level(power_level),
-                            )
-                            .await?;
-                        }
-                        1 => {
-                            // Down button (GPA0).
-                            if active {
-                                if power_level > 1 {
-                                    power_level -= 1;
-                                    info!("power level: {}", power_level);
-                                    cook.set_power(
-                                        cook::Device::LeftCoil,
-                                        cook::Zone::Zone1,
-                                        cook::Power::Level(power_level),
-                                    )
-                                    .await?;
-                                } else {
-                                    info!("powering off");
-                                    cook.set_power(
-                                        cook::Device::LeftCoil,
-                                        cook::Zone::Zone1,
-                                        cook::Power::Off,
-                                    )
-                                    .await?;
-                                    cook.device_off(cook::Device::LeftCoil).await?;
-                                    cook.shutdown().await?;
-                                    active = false;
-                                    power_level = 0;
-                                }
-                            }
-                        }
-                        _ => {}
+                if since.elapsed() > Duration::from_secs(30) && st == SwitchState::OFF {
+                    ctrl.fault_reset(st);
+                }
+            }
+            State::Off { last_input } => {
+                let switches = match select(sw_rx.changed(), Timer::after_secs(1)).await {
+                    Either::First(switches) => switches,
+                    Either::Second(_) => {
+                        // todo poll temp?
+                        let res = ctrl.stove.read_surface_temp(Burner::Left).await;
+                        debug!("read_surface_temp: {:?}", res);
+                        continue;
                     }
-                    Ok::<(), cook::Error>(())
-                }
-                .await;
+                };
 
-                if let Err(e) = result {
-                    error!("{:?}", e);
+                // todo safety switch?
+                if switches != last_input && switches != SwitchState::OFF {
+                    info!("powering on");
+                    if let Err(e) = ctrl.startup(switches, &mut pans_rx).await {
+                        error!("startup failed: {:?}", e);
+
+                        // Attempt a normal shutdown.
+                        if let Err(e) = ctrl.stove.shutdown().await {
+                            error!("shutdown failed: {:?}", e);
+                        }
+
+                        ctrl.fault();
+                        continue;
+                    }
                 }
             }
-            Either::Second(_) => {
-                if let Err(e) = poll_status(&mut cook).await {
-                    error!("poll: {:?}", e);
+            State::On => {
+                // 30m without activity kills the stove.
+                const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+                let timeout = Timer::at(ctrl.last_activity + ACTIVITY_TIMEOUT);
+                let (pans, switches) =
+                    match select3(pans_rx.changed(), sw_rx.changed(), timeout).await {
+                        Either3::First(pans) => (pans, sw_rx.get().await),
+                        Either3::Second(switches) => {
+                            ctrl.last_activity = Instant::now();
+                            (pans_rx.get().await, switches)
+                        }
+                        Either3::Third(_) => {
+                            info!("activity timeout, powering off");
+                            let switches = sw_rx.try_get().unwrap_or_default();
+                            ctrl.shutdown(switches).await;
+                            continue;
+                        }
+                    };
+
+                ctrl.update_link_mode(pans);
+                debug!(
+                    "pans: {:?}, switches: {:?}, link_mode: {}",
+                    pans, switches, ctrl.link_mode
+                );
+
+                if switches == SwitchState::OFF {
+                    info!("powering off");
+                    ctrl.shutdown(switches).await;
+                    continue;
                 }
+
+                if let Err(e) = ctrl.set_power(switches).await {
+                    error!("set_power failed: {:?}", e);
+
+                    // Attempt a normal shutdown.
+                    if let Err(e) = ctrl.stove.shutdown().await {
+                        error!("shutdown failed: {:?}", e);
+                    }
+
+                    ctrl.fault();
+                    continue;
+                }
+
+                leds::LED_STATE
+                    .sender()
+                    .send(led_state(switches, pans, ctrl.link_mode));
             }
         }
     }
 }
 
-async fn poll_status(cook: &mut cook::Cook<'_>) -> Result<(), cook::Error> {
-    use cook::{Device, Zone};
+fn led_state(switches: SwitchState, pans: PanState, link_mode: bool) -> LedState {
+    let (pan_l, st_l) = burner_led(switches.left, pans.left);
+    let (pan_r, st_r) = burner_led(switches.right, pans.right);
 
-    for dev in [Device::LeftCoil, Device::RightCoil] {
-        let zones = if dev == Device::RightCoil {
-            &[Zone::Zone1, Zone::Zone2][..]
-        } else {
-            &[Zone::Zone1][..]
-        };
+    let (pan_m, st_m) = if switches.right > 0 && link_mode {
+        (pan_r, st_r)
+    } else {
+        burner_led(switches.middle, pans.middle)
+    };
 
-        for &zone in zones {
-            let pcb = cook.read_pcb_temp(dev, zone).await?;
-            cook.read_reg_x3(dev, zone).await?;
-            cook.read_reg_x5(dev, zone).await?;
-            let surface = cook.read_surface_temp(dev, zone).await?;
-            info!("{} {:?}: pcb={}°C surface={}°C", dev, zone, pcb, surface);
-        }
+    LedState {
+        pan: [pan_l, pan_m, pan_r],
+        status: [st_l, st_m, st_r],
+        link_mode: if link_mode { Pattern::On } else { Pattern::Off },
     }
-    Ok(())
 }
 
-#[embassy_executor::task]
-async fn can_debug(mut rx: twai::TwaiRx<'static, Async>) {
-    loop {
-        let msg = rx.receive_async().await.unwrap();
-        let id = match msg.id() {
-            embedded_can::Id::Standard(id) => id.as_raw() as u32,
-            embedded_can::Id::Extended(id) => id.as_raw(),
-        };
+fn burner_led(sw: u8, pan: Pan) -> (Pattern, Status) {
+    let pan_led = if matches!(pan, Pan::Present(_)) {
+        Pattern::On
+    } else if sw > 0 {
+        Pattern::Slow
+    } else {
+        Pattern::Off
+    };
 
-        debug!("recv {:03x} {:02X}", id, msg.data());
-    }
+    let status = if sw > 0 {
+        Status::Green(Pattern::On)
+    } else {
+        // TODO
+        // Status::Amber(Pattern::On, 128)
+        Status::Green(Pattern::Off)
+    };
+
+    (pan_led, status)
 }

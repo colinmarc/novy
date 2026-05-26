@@ -1,6 +1,6 @@
 //! Helpers for the three mcp23017s, which are connected to rotary switches.
 
-use defmt::{debug, error, info};
+use defmt::{debug, error};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::{Duration, Timer};
 use esp_hal::{gpio::Input, i2c};
@@ -19,31 +19,18 @@ const GPPUA: u8 = 0x0C;
 const GPIOA: u8 = 0x12;
 // const GPIOB: u8 = 0x13;
 
-// Proposed mapping of dial (0->11) to level (1 -> 14):
-//  - 0 to off/standby
-//  - 1 to 3
-//  - 2 to 5
-//  - 3 to 6
-//  - 4 to 7
-//  - 5 to 8
-//  - 6 to 9
-//  - 7 to 10
-//  - 8 to 12
-//  - 9 to 14
-//  - 10 to boost
-//  - 11 NC
-
 struct Device(u8);
 const SW1: Device = Device(0x20);
 const SW2: Device = Device(0x21);
 const SW3: Device = Device(0x22);
 
 pub(crate) async fn init(i2c: &'static I2cBus) -> Result<(), i2c::master::Error> {
-    let devices = [SW1]; // TODO
+    let devices = [SW1, SW2, SW3];
     let mut guard = i2c.lock().await;
 
     for dev in devices {
         // Enable MIRROR and ODR for INTA
+        // MIRROR=1, ODR=1.
         guard.write_async(dev.0, &[IOCON, 0b01000100]).await?;
 
         // Enable pullups.
@@ -61,48 +48,63 @@ pub(crate) async fn init(i2c: &'static I2cBus) -> Result<(), i2c::master::Error>
 /// Returns the level of each switch (0-11);
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, defmt::Format)]
 pub(crate) struct SwitchState {
-    pub(crate) sw1: u8,
-    pub(crate) sw2: u8,
-    pub(crate) sw3: u8,
+    pub(crate) left: u8,
+    pub(crate) middle: u8,
+    pub(crate) right: u8,
 }
 
-pub(crate) static SWITCH_STATE: Watch<CriticalSectionRawMutex, SwitchState, 2> = Watch::new();
+impl SwitchState {
+    pub(crate) const OFF: Self = SwitchState {
+        left: 0,
+        middle: 0,
+        right: 0,
+    };
+}
+
+pub(crate) static SWITCH_STATE: Watch<CriticalSectionRawMutex, SwitchState, 2> =
+    Watch::new_with(SwitchState::OFF);
 
 #[embassy_executor::task]
 pub(crate) async fn monitor_switches(i2c: &'static super::I2cBus, mut inta: Input<'static>) {
     init(i2c).await.unwrap();
 
+    // Read the initial switch positions.
+    if let Err(e) = read_switches(i2c).await {
+        error!("initial switch read failed: {:?}", e);
+    }
+
     loop {
-        if let Err(e) = monitor_switches_inner(i2c, &mut inta).await {
+        // let _ = inta.wait_for_low().await;
+        embassy_time::Timer::after_secs(1).await;
+
+        if let Err(e) = read_switches(i2c).await {
             error!("failed to read switches: {:?}", e);
             Timer::after(Duration::from_secs(1)).await;
         }
     }
 }
 
-async fn monitor_switches_inner(
-    i2c: &'static super::I2cBus,
-    inta: &mut Input<'static>,
-) -> Result<(), i2c::master::Error> {
-    let _ = inta.wait_for_low().await;
-    let sw1_state = read_active(i2c, SW1).await?;
-    // let sw2_state = read_active(i2c, DEV2.0).await.unwrap();
-    // let sw3_state = read_active(i2c, DEV3.0).await.unwrap();
+async fn read_switches(i2c: &'static super::I2cBus) -> Result<(), i2c::master::Error> {
+    let left_raw = read_active(i2c, SW1).await?;
+    let middle_raw = read_active(i2c, SW2).await?;
+    let right_raw = read_active(i2c, SW3).await?;
 
     debug!(
-        "interrupt fired sw0={:b} sw1={:b} sw2={:b}",
-        sw1_state, 0, 0
+        "interrupt fired sw1={:b} sw2={:b} sw3={:b}",
+        left_raw, middle_raw, right_raw
     );
 
-    // Filter out states where 2 or 0 pins are low.
-    if sw1_state.count_ones() == 1 {
-        SWITCH_STATE.sender().send(SwitchState {
-            sw1: sw1_state.trailing_zeros() as _,
-            sw2: 0,
-            sw3: 0,
-        });
-    }
+    let tx = SWITCH_STATE.sender();
+    let prev = tx.try_get().unwrap_or(SwitchState::OFF);
+    let state = SwitchState {
+        left: decode_switch(left_raw).unwrap_or(prev.left),
+        middle: decode_switch(middle_raw).unwrap_or(prev.middle),
+        right: decode_switch(right_raw).unwrap_or(prev.right),
+    };
 
+    if state != prev {
+        tx.send(state);
+    }
     Ok(())
 }
 
@@ -112,6 +114,7 @@ async fn read_active(i2c: &'static I2cBus, dev: Device) -> Result<u16, i2c::mast
 
     let mut buf = [0u8; 2];
     guard.write_read_async(dev.0, &[GPIOA], &mut buf).await?;
+    debug!("buf: {:?}", buf);
 
     // The order is:
     // 0->7: GPB0->7
@@ -122,4 +125,12 @@ async fn read_active(i2c: &'static I2cBus, dev: Device) -> Result<u16, i2c::mast
     let state = !(((a as u16 & 0x0F) << 8) | (b as u16)) & 0x0FFF;
 
     Ok(state)
+}
+
+fn decode_switch(raw: u16) -> Option<u8> {
+    if raw.count_ones() != 1 {
+        return None;
+    }
+
+    Some(raw.trailing_zeros() as u8)
 }

@@ -1,0 +1,200 @@
+#![no_std]
+#![no_main]
+#![deny(
+    clippy::mem_forget,
+    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
+    holding buffers for the duration of a data transfer."
+)]
+#![allow(clippy::large_stack_frames)]
+
+use defmt::{debug, error, info};
+use embassy_executor::Spawner;
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
+use embassy_time::{Duration, Timer, with_timeout};
+use embedded_can::Frame as _;
+use esp_hal::{
+    Async,
+    clock::CpuClock,
+    gpio::{Input, Level, Output, OutputConfig},
+    i2c::master::I2c,
+    timer::timg::TimerGroup,
+    twai,
+};
+use panic_rtt_target as _;
+use static_cell::StaticCell;
+
+use crate::iox::SwitchState;
+
+esp_bootloader_esp_idf::esp_app_desc!();
+
+type I2cBus = Mutex<NoopRawMutex, I2c<'static, Async>>;
+
+static I2C_BUS: static_cell::StaticCell<I2cBus> = StaticCell::new();
+
+mod cook;
+mod iox;
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
+    rtt_target::rtt_init_defmt!();
+
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    // These GPIO pins are in use by the module and should not be used.
+    let _ = peripherals.GPIO24;
+    let _ = peripherals.GPIO25;
+    let _ = peripherals.GPIO26;
+    let _ = peripherals.GPIO27;
+    let _ = peripherals.GPIO28;
+    let _ = peripherals.GPIO29;
+    let _ = peripherals.GPIO30;
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_interrupt =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+
+    // Pin 5 (presence) is tied to 3.3V on the PCB.
+    // Pin 6 (pan detection heartbeat) on GPIO23: ~52 Hz, 25% duty.
+    let mut ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(esp_hal::ledc::LSGlobalClkSource::APBClk);
+
+    let mut hb_timer = ledc.timer::<esp_hal::ledc::LowSpeed>(esp_hal::ledc::timer::Number::Timer0);
+    esp_hal::ledc::timer::TimerIFace::configure(
+        &mut hb_timer,
+        esp_hal::ledc::timer::config::Config {
+            duty: esp_hal::ledc::timer::config::Duty::Duty14Bit,
+            clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
+            frequency: esp_hal::time::Rate::from_hz(26),
+        },
+    )
+    .unwrap();
+
+    let mut hb_channel = ledc.channel(esp_hal::ledc::channel::Number::Channel0, peripherals.GPIO23);
+    esp_hal::ledc::channel::ChannelIFace::configure(
+        &mut hb_channel,
+        esp_hal::ledc::channel::config::Config {
+            timer: &hb_timer,
+            duty_pct: 25,
+            drive_mode: esp_hal::gpio::DriveMode::PushPull,
+        },
+    )
+    .unwrap();
+
+    let i2c = I2c::new(peripherals.I2C0, Default::default())
+        .unwrap()
+        .with_sda(peripherals.GPIO21)
+        .with_scl(peripherals.GPIO7)
+        .into_async();
+    let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
+
+    let inta = Input::new(peripherals.GPIO6, Default::default());
+    spawner.spawn(iox::monitor_switches(i2c_bus, inta).unwrap());
+
+    let can_config = twai::TwaiConfiguration::new(
+        peripherals.TWAI0,
+        peripherals.GPIO5, // RXD
+        peripherals.GPIO4, // TXD
+        twai::BaudRate::B125K,
+        twai::TwaiMode::Normal,
+    );
+
+    let (can_rx, mut can_tx) = can_config.into_async().start().split();
+    spawner.spawn(cook::can_dispatch(can_rx).unwrap());
+    let mut cook = cook::Cook::new(can_tx);
+
+    let mut sw = iox::SWITCH_STATE.receiver().unwrap();
+    let mut switch_state = SwitchState::default();
+    let mut power_level: u8 = 0;
+    let mut active = false;
+    let mut poll_ticker = embassy_time::Ticker::every(Duration::from_secs(1));
+    loop {
+        use embassy_futures::select::{Either, select};
+
+        match select(sw.changed(), poll_ticker.next()).await {
+            Either::First(v) => {
+                debug!("switch state: {:?}", v);
+
+                let result = async {
+                    match v.sw1 {
+                        8 => {
+                            // Up button (GPB1).
+                            if !active {
+                                cook.startup().await?;
+                                active = true;
+                                power_level = 1;
+                            } else if power_level < 14 {
+                                power_level += 1;
+                            }
+                            info!("power level: {}", power_level);
+                            cook.set_power(
+                                cook::Burner::Left,
+                                cook::Power::Level(power_level),
+                            )
+                            .await?;
+                        }
+                        1 => {
+                            // Down button (GPA0).
+                            if active {
+                                if power_level > 1 {
+                                    power_level -= 1;
+                                    info!("power level: {}", power_level);
+                                    cook.set_power(
+                                        cook::Burner::Left,
+                                        cook::Power::Level(power_level),
+                                    )
+                                    .await?;
+                                } else {
+                                    info!("powering off");
+                                    cook.set_power(cook::Burner::Left, cook::Power::Off)
+                                        .await?;
+                                    cook.node_off(cook::Node::LeftCoil).await?;
+                                    cook.shutdown().await?;
+                                    active = false;
+                                    power_level = 0;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok::<(), cook::Error>(())
+                }
+                .await;
+
+                if let Err(e) = result {
+                    error!("{:?}", e);
+                }
+            }
+            Either::Second(_) => {
+                if let Err(e) = poll_status(&mut cook).await {
+                    error!("poll: {:?}", e);
+                }
+            }
+        }
+    }
+}
+
+async fn poll_status(cook: &mut cook::Cook<'_>) -> Result<(), cook::Error> {
+    for burner in cook::Burner::ALL {
+        let pcb = cook.read_pcb_temp(burner).await?;
+        cook.read_reg_x3(burner).await?;
+        cook.read_reg_x5(burner).await?;
+        let surface = cook.read_surface_temp(burner).await?;
+        info!("{:?}: pcb={}°C surface={}°C", burner, pcb, surface);
+    }
+    Ok(())
+}
+
+#[embassy_executor::task]
+async fn can_debug(mut rx: twai::TwaiRx<'static, Async>) {
+    loop {
+        let msg = rx.receive_async().await.unwrap();
+        let id = match msg.id() {
+            embedded_can::Id::Standard(id) => id.as_raw() as u32,
+            embedded_can::Id::Extended(id) => id.as_raw(),
+        };
+
+        debug!("recv {:03x} {:02X}", id, msg.data());
+    }
+}
